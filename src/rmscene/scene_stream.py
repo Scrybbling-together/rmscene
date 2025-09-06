@@ -305,7 +305,7 @@ class PageInfoBlock(Block):
 
     @classmethod
     def from_stream(cls, stream: TaggedBlockReader) -> PageInfoBlock:
-        "Parse page info block"
+        "Parsehttps://github.com/ChenghaoMou/rmscene/tree/feature/highlight_color page info block"
         _logger.debug("Reading %s", cls.__name__)
         info = PageInfoBlock(
             loads_count=stream.read_int(1),
