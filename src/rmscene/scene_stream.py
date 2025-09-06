@@ -610,6 +610,22 @@ def glyph_range_from_stream(stream: TaggedBlockReader) -> si.GlyphRange:
             for _ in range(num_rects)
         ]
 
+    # This is for the color information (highlight & shader) - same as for lines
+    if stream.bytes_remaining_in_block() >= 6:
+        # not sure what this is, seems fixed x84x01
+        unk = stream.data.read_bytes(2)
+        b = stream.data.read_uint8()
+        g = stream.data.read_uint8()
+        r = stream.data.read_uint8()
+        a = stream.data.read_uint8()
+        rgba = (r, g, b, a)
+
+        if unk != b"\xa4\x01" or rgba not in si.HARDCODED_COLORMAP:
+            _logger.warning(f"Unhandled color {rgba} with prefix {unk}")
+            stream.data.data.seek(-6, io.SEEK_CUR)
+        else:
+            color = si.HARDCODED_COLORMAP[rgba]
+
     return si.GlyphRange(start, length, text, color, rectangles)
 
 
