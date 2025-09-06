@@ -6,22 +6,24 @@ With help from ddvk's v6 reader, and enum values from remt.
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from collections.abc import Iterable
-import math
-from uuid import UUID, uuid4
-from dataclasses import dataclass, replace, KW_ONLY
+import io
 import logging
+import math
 import typing as tp
+from abc import ABC, abstractmethod
+from collections.abc import Iterable, Iterator
+from dataclasses import KW_ONLY, dataclass, replace
+from typing import Optional
+from uuid import UUID, uuid4
 
 from packaging.version import Version
 
-from .tagged_block_common import CrdtId, LwwValue
-from .tagged_block_reader import TaggedBlockReader
-from .tagged_block_writer import TaggedBlockWriter
+from . import scene_items as si
 from .crdt_sequence import CrdtSequence, CrdtSequenceItem
 from .scene_tree import SceneTree
-from . import scene_items as si
+from .tagged_block_common import CrdtId, LwwValue, UnexpectedBlockError
+from .tagged_block_reader import MainBlockInfo, TaggedBlockReader
+from .tagged_block_writer import TaggedBlockWriter
 
 _logger = logging.getLogger(__name__)
 
@@ -43,6 +45,16 @@ class Block(ABC):
         """Return (min_version, current_version) to use when writing."""
         return (1, 1)
 
+    def get_block_type(self) -> int:
+        """Return block type for this block.
+
+        By default, returns the block's BLOCK_TYPE attribute, but this method
+        can be overriden if a single block subclass can handle multiple block
+        types.
+
+        """
+        return self.BLOCK_TYPE
+
     @classmethod
     def lookup(cls, block_type: int) -> tp.Optional[tp.Type[Block]]:
         if getattr(cls, "BLOCK_TYPE", None) == block_type:
@@ -53,13 +65,116 @@ class Block(ABC):
         return None
 
     @classmethod
+    def read(self, reader: TaggedBlockReader) -> Optional[Block]:
+        """
+        Maybe parse a block from the reader stream.
+        """
+        with reader.read_block() as block_info:
+            if block_info is None:
+                return
+
+            block_type = Block.lookup(block_info.block_type)
+            if block_type:
+                try:
+                    block = block_type.from_stream(reader)
+                except Exception as e:
+                    _logger.warning("Error reading block: %s", e)
+                    reader.data.data.seek(block_info.offset)
+                    data = reader.data.read_bytes(block_info.size)
+                    block = UnreadableBlock(str(e), data, block_info)
+            else:
+                msg = (
+                    f"Unknown block type {block_info.block_type}. "
+                    f"Skipping {block_info.size} bytes."
+                )
+                _logger.warning(msg)
+                data = reader.data.read_bytes(block_info.size)
+                block = UnreadableBlock(msg, data, block_info)
+
+        # Keep any unparsed extra data
+        block.extra_data = block_info.extra_data
+        return block
+
+    def write(self, writer: TaggedBlockWriter):
+        """Write the block header and content to the stream."""
+        min_version, current_version = self.version_info(writer)
+        with writer.write_block(self.get_block_type(), min_version, current_version):
+            self.to_stream(writer)
+            # Write any leftover extra data that wasn't parsed
+            writer.data.write_bytes(self.extra_data)
+
+    @classmethod
     @abstractmethod
     def from_stream(cls, reader: TaggedBlockReader) -> Block:
+        """Read content of block from stream."""
         raise NotImplementedError()
 
     @abstractmethod
     def to_stream(self, writer: TaggedBlockWriter):
+        """Write content of block to stream."""
         raise NotImplementedError()
+
+
+@dataclass
+class UnreadableBlock(Block):
+    """Represent a block which could not be read for some reason."""
+
+    error: str
+    data: bytes
+    info: MainBlockInfo
+
+    def get_block_type(self) -> int:
+        return self.info.block_type
+
+    @classmethod
+    def from_stream(cls, reader: TaggedBlockReader) -> Block:
+        raise NotImplementedError()
+
+    def to_stream(self, writer: TaggedBlockWriter):
+        writer.data.write_bytes(self.data)
+
+
+@dataclass
+class SceneInfo(Block):
+    BLOCK_TYPE: tp.ClassVar = 0x0D
+
+    def version_info(self, _) -> tuple[int, int]:
+        """Return (min_version, current_version) to use when writing."""
+        return (0, 1)
+
+    current_layer: LwwValue[CrdtId]
+    background_visible: tp.Optional[LwwValue[bool]]
+    root_document_visible: tp.Optional[LwwValue[bool]]
+    paper_size: tp.Optional[tuple[int, int]]
+
+    @classmethod
+    def from_stream(cls, stream: TaggedBlockReader) -> SceneInfo:
+        current_layer = stream.read_lww_id(1)
+        background_visible = (
+            stream.read_lww_bool(2) if stream.bytes_remaining_in_block() > 0 else None
+        )
+        root_document_visible = (
+            stream.read_lww_bool(3) if stream.bytes_remaining_in_block() > 0 else None
+        )
+        paper_size = (
+            stream.read_int_pair(5) if stream.bytes_remaining_in_block() > 0 else None
+        )
+
+        return SceneInfo(
+            current_layer=current_layer,
+            background_visible=background_visible,
+            root_document_visible=root_document_visible,
+            paper_size=paper_size,
+        )
+
+    def to_stream(self, writer: TaggedBlockWriter):
+        writer.write_lww_id(1, self.current_layer)
+        if self.background_visible:
+            writer.write_lww_bool(2, self.background_visible)
+        if self.root_document_visible:
+            writer.write_lww_bool(3, self.root_document_visible)
+        if self.paper_size:
+            writer.write_int_pair(5, self.paper_size)
 
 
 @dataclass
@@ -127,6 +242,12 @@ class MigrationInfoBlock(Block):
 class TreeNodeBlock(Block):
     BLOCK_TYPE: tp.ClassVar = 0x02
 
+    def version_info(self, writer: TaggedBlockWriter) -> tuple[int, int]:
+        """Return (min_version, current_version) to use when writing."""
+        version = writer.options.get("version", Version("9999"))
+        # XXX this is a guess about which version this changed in
+        return (1, 2) if (version >= Version("3.4")) else (1, 1)
+
     group: si.Group
 
     @classmethod
@@ -180,11 +301,11 @@ class PageInfoBlock(Block):
     merges_count: int
     text_chars_count: int
     text_lines_count: int
-    _unknown: int = 0
+    type_folio_use_count: int = 0
 
     @classmethod
     def from_stream(cls, stream: TaggedBlockReader) -> PageInfoBlock:
-        "Parse page info block"
+        "Parsehttps://github.com/ChenghaoMou/rmscene/tree/feature/highlight_color page info block"
         _logger.debug("Reading %s", cls.__name__)
         info = PageInfoBlock(
             loads_count=stream.read_int(1),
@@ -193,7 +314,7 @@ class PageInfoBlock(Block):
             text_lines_count=stream.read_int(4),
         )
         if stream.bytes_remaining_in_block():
-            info._unknown = stream.read_int(5)
+            info.type_folio_use_count = stream.read_int(5)
         return info
 
     def to_stream(self, writer: TaggedBlockWriter):
@@ -204,7 +325,7 @@ class PageInfoBlock(Block):
         writer.write_int(4, self.text_lines_count)
         version = writer.options.get("version", Version("9999"))
         if version >= Version("3.2.2"):
-            writer.write_int(5, self._unknown)
+            writer.write_int(5, self.type_folio_use_count)
 
 
 @dataclass
@@ -318,13 +439,41 @@ def line_from_stream(stream: TaggedBlockReader, version: int = 2) -> si.Line:
     # XXX unused
     timestamp = stream.read_id(6)
 
-    return si.Line(color, tool, points, thickness_scale, starting_length)
+    if stream.bytes_remaining_in_block() >= 3:
+        try:
+            move_id = stream.read_id(7)
+        except UnexpectedBlockError as _:
+            move_id = None
+    else:
+        move_id = None
+
+    # This is for the color information (highlight & shader)
+    if stream.bytes_remaining_in_block() >= 6:
+        # not sure what this is, seems fixed x84x01
+        unk = stream.data.read_bytes(2)
+        b = stream.data.read_uint8()
+        g = stream.data.read_uint8()
+        r = stream.data.read_uint8()
+        a = stream.data.read_uint8()
+        rgba = (r, g, b, a)
+
+        if unk != b"\x84\x01" or rgba not in si.HARDCODED_COLORMAP:
+            _logger.warning(f"Unhandled color {rgba} with prefix {unk}")
+            stream.data.data.seek(-6, io.SEEK_CUR)
+        else:
+            color = si.HARDCODED_COLORMAP[rgba]
+
+    return si.Line(color, tool, points, thickness_scale, starting_length, move_id)
 
 
 def line_to_stream(line: si.Line, writer: TaggedBlockWriter, version: int = 2):
     _logger.debug("Writing Line version %d", version)
     writer.write_int(1, line.tool)
-    writer.write_int(2, line.color)
+    is_highlight_color = line.color in si.HARDCODED_COLORMAP.values()
+    if is_highlight_color:
+        writer.write_int(2, si.PenColor.HIGHLIGHT)
+    else:
+        writer.write_int(2, line.color)
     writer.write_double(3, line.thickness_scale)
     writer.write_float(4, line.starting_length)
     with writer.write_subblock(5):
@@ -334,12 +483,25 @@ def line_to_stream(line: si.Line, writer: TaggedBlockWriter, version: int = 2):
     # XXX didn't save
     timestamp = CrdtId(0, 1)
     writer.write_id(6, timestamp)
+    if line.move_id is not None:
+        writer.write_id(7, line.move_id)
+
+    if is_highlight_color:
+        rgba = [
+            key for key, value in si.HARDCODED_COLORMAP.items() if value == line.color
+        ][0]
+        writer.data.write_bytes(b"\x84\x01")
+        writer.data.write_uint8(rgba[2])
+        writer.data.write_uint8(rgba[1])
+        writer.data.write_uint8(rgba[0])
+        writer.data.write_uint8(rgba[3])
 
 
 @dataclass
 class SceneItemBlock(Block):
     parent_id: CrdtId
     item: CrdtSequenceItem
+    extra_value_data: bytes = b""
 
     ITEM_TYPE: tp.ClassVar[int] = 0
 
@@ -358,6 +520,8 @@ class SceneItemBlock(Block):
             subclass = SceneLineItemBlock
         elif block_type == SceneTextItemBlock.BLOCK_TYPE:
             subclass = SceneTextItemBlock
+        elif block_type == SceneTombstoneItemBlock.BLOCK_TYPE:
+            subclass = SceneTombstoneItemBlock
         else:
             raise ValueError(
                 "unknown scene type %d in %s" % (block_type, stream.current_block)
@@ -374,16 +538,17 @@ class SceneItemBlock(Block):
                 item_type = stream.data.read_uint8()
                 assert item_type == subclass.ITEM_TYPE
                 value = subclass.value_from_stream(stream)
-            # Keep known extra data
-            extra_data = block_info.extra_data
+            # Keep known extra data from within the value subblock
+
+            extra_value_data = block_info.extra_data
         else:
             value = None
-            extra_data = b""
+            extra_value_data = b""
 
         return subclass(
             parent_id,
             CrdtSequenceItem(item_id, left_id, right_id, deleted_length, value),
-            extra_data=extra_data,
+            extra_value_data=extra_value_data,
         )
 
     def to_stream(self, writer: TaggedBlockWriter):
@@ -399,7 +564,7 @@ class SceneItemBlock(Block):
                 writer.data.write_uint8(self.ITEM_TYPE)
                 self.value_to_stream(writer, self.item.value)
 
-                writer.data.write_bytes(self.extra_data)
+                writer.data.write_bytes(self.extra_value_data)
 
     @classmethod
     @abstractmethod
@@ -417,11 +582,16 @@ class SceneItemBlock(Block):
 
 
 def glyph_range_from_stream(stream: TaggedBlockReader) -> si.GlyphRange:
-    start = stream.read_int(2)
-    length = stream.read_int(3)
-    color_id = stream.read_int(4)  # ddvk has this as a byte?
+    # Since reMarkable version 3.6, the start and length are optional
+    start = stream.read_int_optional(2)
+    length = stream.read_int_optional(3)
+
+    color_id = stream.read_int(4)
     color = si.PenColor(color_id)
     text = stream.read_string(5)
+
+    if length is None:
+        length = len(text)
 
     # Note: the decoded text length is not always the same as the length in the
     # glyph range...
@@ -444,8 +614,9 @@ def glyph_range_from_stream(stream: TaggedBlockReader) -> si.GlyphRange:
 
 
 def glyph_range_to_stream(stream: TaggedBlockWriter, item: si.GlyphRange):
-    stream.write_int(2, item.start)
-    stream.write_int(3, item.length)
+    if item.start is not None:
+        stream.write_int(2, item.start)
+        stream.write_int(3, item.length)
     stream.write_int(4, item.color)
     stream.write_string(5, item.text)
     with stream.write_subblock(6):
@@ -457,11 +628,20 @@ def glyph_range_to_stream(stream: TaggedBlockWriter, item: si.GlyphRange):
             stream.data.write_float64(rect.h)
 
 
+class SceneTombstoneItemBlock(SceneItemBlock):
+    BLOCK_TYPE: tp.ClassVar = 0x08
+
+    @classmethod
+    def value_from_stream(cls, reader: TaggedBlockReader):
+        pass
+
+    def value_to_stream(self, writer: TaggedBlockWriter, value):
+        pass
+
+
 class SceneGlyphItemBlock(SceneItemBlock):
     BLOCK_TYPE: tp.ClassVar = 0x03
     ITEM_TYPE: tp.ClassVar = 0x01
-
-    value: tp.Optional[si.GlyphRange]
 
     @classmethod
     def value_from_stream(cls, reader: TaggedBlockReader) -> si.GlyphRange:
@@ -476,8 +656,6 @@ class SceneGroupItemBlock(SceneItemBlock):
     BLOCK_TYPE: tp.ClassVar = 0x04
     ITEM_TYPE: tp.ClassVar = 0x02
 
-    value: tp.Optional[CrdtId]
-
     @classmethod
     def value_from_stream(cls, reader: TaggedBlockReader) -> CrdtId:
         # XXX don't know what this means
@@ -491,8 +669,6 @@ class SceneGroupItemBlock(SceneItemBlock):
 class SceneLineItemBlock(SceneItemBlock):
     BLOCK_TYPE: tp.ClassVar = 0x05
     ITEM_TYPE: tp.ClassVar = 0x03
-
-    value: tp.Optional[si.Line]
 
     def version_info(self, writer: TaggedBlockWriter) -> tuple[int, int]:
         """Return (min_version, current_version) to use when writing."""
@@ -540,8 +716,9 @@ def text_item_from_stream(stream: TaggedBlockReader) -> CrdtSequenceItem[str | i
             # It seems that formats are stored on empty strings, so it's one or the other
             if fmt is not None:
                 if text:
-                    _logger.error("Unhandled combined text and format: %s, %s",
-                                  text, fmt)
+                    _logger.error(
+                        "Unhandled combined text and format: %s, %s", text, fmt
+                    )
                 value = fmt
             else:
                 value = text
@@ -585,8 +762,11 @@ def text_format_from_stream(
             format_type = si.ParagraphStyle(format_code)
         except ValueError:
             _logger.warning("Unrecognised text format code %d.", format_code)
-            _logger.debug("Unrecognised text format code %d at position %d.",
-                          format_code, stream.data.tell())
+            _logger.debug(
+                "Unrecognised text format code %d at position %d.",
+                format_code,
+                stream.data.tell(),
+            )
             format_type = si.ParagraphStyle.PLAIN  # fallback
 
     return (char_id, LwwValue(timestamp, format_type))
@@ -622,7 +802,6 @@ class RootTextBlock(Block):
         assert block_id == CrdtId(0, 0)
 
         with stream.read_subblock(2):
-
             # Text items
             with stream.read_subblock(1):
                 with stream.read_subblock(1):
@@ -654,7 +833,7 @@ class RootTextBlock(Block):
             styles=text_formats,
             pos_x=pos_x,
             pos_y=pos_y,
-            width=width
+            width=width,
         )
         return RootTextBlock(block_id, value)
 
@@ -663,7 +842,6 @@ class RootTextBlock(Block):
         writer.write_id(1, self.block_id)
 
         with writer.write_subblock(2):
-
             # Text items
             text_items = self.value.items.sequence_items()
             with writer.write_subblock(1):
@@ -692,29 +870,20 @@ class RootTextBlock(Block):
 ## Functions to read and write streams of blocks
 
 
-def _read_blocks(stream: TaggedBlockReader) -> Iterable[Block]:
+def _read_blocks(stream: TaggedBlockReader) -> Iterator[Block]:
     """
     Parse blocks from reMarkable v6 file.
     """
     while True:
-        with stream.read_block() as block_info:
-            if block_info is None:
-                # no more blocks
-                return
-
-            block_type = Block.lookup(block_info.block_type)
-            if block_type:
-                yield block_type.from_stream(stream)
-            else:
-                _logger.error(
-                    "Unknown block type %s. Skipping %d bytes.",
-                    block_info.block_type,
-                    block_info.size,
-                )
-                stream.data.read_bytes(block_info.size)
+        maybe_block = Block.read(stream)
+        if maybe_block:
+            yield maybe_block
+        else:
+            # no more blocks
+            return
 
 
-def read_blocks(data: tp.BinaryIO) -> Iterable[Block]:
+def read_blocks(data: tp.BinaryIO) -> Iterator[Block]:
     """
     Parse reMarkable file and return iterator of document items.
 
@@ -723,12 +892,6 @@ def read_blocks(data: tp.BinaryIO) -> Iterable[Block]:
     stream = TaggedBlockReader(data)
     stream.read_header()
     yield from _read_blocks(stream)
-
-
-def _write_block(writer: TaggedBlockWriter, block: Block):
-    min_version, current_version = block.version_info(writer)
-    with writer.write_block(block.BLOCK_TYPE, min_version, current_version):
-        block.to_stream(writer)
 
 
 def write_blocks(
@@ -742,7 +905,7 @@ def write_blocks(
     stream = TaggedBlockWriter(data, options=options)
     stream.write_header()
     for block in blocks:
-        _write_block(stream, block)
+        block.write(stream)
 
 
 def build_tree(tree: SceneTree, blocks: Iterable[Block]):
@@ -769,7 +932,7 @@ def build_tree(tree: SceneTree, blocks: Iterable[Block]):
         elif isinstance(b, SceneGroupItemBlock):
             # Add this entry to children of parent_id
             node_id = b.item.value
-            if node_id == None:
+            if node_id is None:
                 continue
             if node_id not in tree:
                 raise ValueError(
@@ -783,7 +946,9 @@ def build_tree(tree: SceneTree, blocks: Iterable[Block]):
         elif isinstance(b, RootTextBlock):
             if tree.root_text is not None:
                 _logger.error(
-                    "Overwriting root text\n  Old: %s\n  New: %s", tree.root_text, b.value
+                    "Overwriting root text\n  Old: %s\n  New: %s",
+                    tree.root_text,
+                    b.value,
                 )
             tree.root_text = b.value
 
@@ -801,7 +966,7 @@ def read_tree(data: tp.BinaryIO) -> SceneTree:
     return tree
 
 
-def simple_text_document(text: str, author_uuid=None) -> Iterable[Block]:
+def simple_text_document(text: str, author_uuid=None) -> Iterator[Block]:
     """Return the basic blocks to represent `text` as plain text.
 
     TODO: replace this with a way to generate the tree with given text, and a
@@ -816,35 +981,43 @@ def simple_text_document(text: str, author_uuid=None) -> Iterable[Block]:
 
     yield MigrationInfoBlock(migration_id=CrdtId(1, 1), is_device=True)
 
-    yield PageInfoBlock(loads_count=1,
-                        merges_count=0,
-                        text_chars_count=len(text) + 1,
-                        text_lines_count=text.count("\n") + 1)
+    yield PageInfoBlock(
+        loads_count=1,
+        merges_count=0,
+        text_chars_count=len(text) + 1,
+        text_lines_count=text.count("\n") + 1,
+    )
 
-    yield SceneTreeBlock(tree_id=CrdtId(0, 11),
-                         node_id=CrdtId(0, 0),
-                         is_update=True,
-                         parent_id=CrdtId(0, 1))
+    yield SceneTreeBlock(
+        tree_id=CrdtId(0, 11),
+        node_id=CrdtId(0, 0),
+        is_update=True,
+        parent_id=CrdtId(0, 1),
+    )
 
     yield RootTextBlock(
         block_id=CrdtId(0, 0),
         value=si.Text(
-            items=CrdtSequence([
-                CrdtSequenceItem(
-                    item_id=CrdtId(1, 16),
-                    left_id=CrdtId(0, 0),
-                    right_id=CrdtId(0, 0),
-                    deleted_length=0,
-                    value=text,
-                )
-            ]),
+            items=CrdtSequence(
+                [
+                    CrdtSequenceItem(
+                        item_id=CrdtId(1, 16),
+                        left_id=CrdtId(0, 0),
+                        right_id=CrdtId(0, 0),
+                        deleted_length=0,
+                        value=text,
+                    )
+                ]
+            ),
             styles={
-                CrdtId(0, 0): LwwValue(timestamp=CrdtId(1, 15), value=si.ParagraphStyle.PLAIN),
+                CrdtId(0, 0): LwwValue(
+                    timestamp=CrdtId(1, 15), value=si.ParagraphStyle.PLAIN
+                ),
             },
             pos_x=-468.0,
             pos_y=234.0,
             width=936.0,
-        )
+        ),
     )
 
     yield TreeNodeBlock(
@@ -856,7 +1029,7 @@ def simple_text_document(text: str, author_uuid=None) -> Iterable[Block]:
     yield TreeNodeBlock(
         si.Group(
             node_id=CrdtId(0, 11),
-            label=LwwValue(timestamp=CrdtId(0, 12), value='Layer 1'),
+            label=LwwValue(timestamp=CrdtId(0, 12), value="Layer 1"),
         )
     )
 
@@ -867,6 +1040,6 @@ def simple_text_document(text: str, author_uuid=None) -> Iterable[Block]:
             left_id=CrdtId(0, 0),
             right_id=CrdtId(0, 0),
             deleted_length=0,
-            value=CrdtId(0, 11)
-        )
+            value=CrdtId(0, 11),
+        ),
     )

@@ -8,6 +8,66 @@ To convert rm files to other formats, you can use [rmc](https://github.com/rickl
 
 ## Changelog
 
+### Unreleased
+
+### v0.7.0
+
+Change in block properties:
+
+- Some SceneInfo values are now optional ([#40](https://github.com/ricklupton/rmscene/issues/40))
+
+New feature:
+
+- Add support for `paper_size` field on some SceneInfo blocks
+
+### v0.6.1
+
+Fixes:
+
+- Fix AssertionError when some ids are missing in a `CrdtSequence` ([#36](https://github.com/ricklupton/rmscene/pull/36))
+- Fix ValueError when the node_id is missing in a `SceneGroupItemBlock` ([#16](https://github.com/ricklupton/rmscene/issues/16)) 
+- Store any unparsed data in blocks as raw bytes to allow for round-trip saving of files written in a newer format than the parsing code knows about.
+
+### v0.6.0
+
+New features:
+
+- Add support for new blocks: `0x0D` (SceneInfo) and `0x08` (SceneTombstoneItemBlock) ([#24](https://github.com/ricklupton/rmscene/pull/24/))
+- Add support for `move_id` field on some SceneLineItems ([#24](https://github.com/ricklupton/rmscene/pull/24/))
+- Add support for new pen types and colours ([#31](https://github.com/ricklupton/rmscene/pull/31))
+
+### v0.5.0
+
+Breaking changes:
+
+- The `start` property of `GlyphRange` items is now optional
+  ([#15](https://github.com/ricklupton/rmscene/pull/15/)).
+- The representation of formatted text spans has changed. Rather than
+  using nested structures like `BoldSpan` and `ItalicSpan`, the
+  `CrdtStr` objects now have optional text properties like
+  `font-weight` and `font-style`. This simplifies the parsing code and
+  the resulting data structure.
+
+New features:
+
+- Improved error recovery. An error during parsing, or an unknown block type,
+  results in an `UnreadableBlock` containing the data that could not be read, so
+  that parsing of other blocks can continue.
+- Compatible with new reMarkable software version 3.6 format for
+  highlighted text
+  ([#15](https://github.com/ricklupton/rmscene/pull/15/)).
+- New methods `read_bool_optional` and similar of `TaggedBlockReader`
+  which return a default value if no matching tagged value is present
+  in the block.
+  
+Other changes and fixes:
+
+- The `value` attribute of scene item blocks, which was not being used, has been
+  removed.
+- Check more carefully for sub-blocks
+  ([#17](https://github.com/ricklupton/rmscene/issues/17#issuecomment-1701071477)).
+- Type hints fixed for `expand_text_items`.
+
 ### v0.4.0
 
 Breaking changes:
@@ -22,6 +82,7 @@ Breaking changes:
   values are added. Replaces `"line_version"` option.
   
 New features:
+
 - Parse text formatting information (bold and italic) introduced in reMarkable
   software version 3.3.
 
@@ -59,4 +120,10 @@ Other changes:
 
 ## Acknowledgements
 
-https://github.com/ddvk/reader helped a lot in figuring out the structure and meaning of the files.
+https://github.com/ddvk/reader helped a lot in figuring out the structure and meaning of the files.  [@adq](https://github.com/adq) discovered a means to get debug output (see [issue 25](https://github.com/ricklupton/rmscene/issues/25)) which is very helpful for understanding the format.
+
+Contributors:
+- [@Azeirah](https://github.com/Azeirah) -- code and reporting issues
+- [@adq](https://github.com/adq) -- code and reporting issues
+- [@dotlambda](https://github.com/dotlambda) -- packaging
+- [@ChenghaoMou](https://github.com/ChenghaoMou)

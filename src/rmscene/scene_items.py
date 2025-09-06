@@ -1,14 +1,13 @@
 """Data structures for the contents of a scene."""
 
-from dataclasses import dataclass, field
 import enum
 import logging
 import typing as tp
+from dataclasses import dataclass, field
 
-from .tagged_block_common import CrdtId, LwwValue
 from .crdt_sequence import CrdtSequence
+from .tagged_block_common import CrdtId, LwwValue
 from .text import expand_text_items
-
 
 _logger = logging.getLogger(__name__)
 
@@ -76,6 +75,52 @@ class PenColor(enum.IntEnum):
 
     GRAY_OVERLAP = 8
 
+    # All highlight colors share the same value.
+    # This is a placeholder, see the colormap below for details.
+    HIGHLIGHT = 9
+
+    GREEN_2 = 10
+    CYAN = 11
+    MAGENTA = 12
+    
+    YELLOW_2 = 13
+
+    # HIGHLIGHT enumerated
+    HIGHLIGHT_YELLOW = 14
+    HIGHLIGHT_BLUE = 15
+    HIGHLIGHT_PINK = 16
+    HIGHLIGHT_ORANGE = 17
+    HIGHLIGHT_GREEN = 18
+    HIGHLIGHT_GRAY = 19
+
+    # SHADER enumerated
+    SHADER_GRAY = 20
+    SHADER_ORANGE = 21
+    SHADER_MAGENTA = 22
+    SHADER_BLUE = 23
+    SHADER_RED = 24
+    SHADER_GREEN = 25
+    SHADER_YELLOW = 26
+    SHADER_CYAN = 27
+
+# colors hardcoded in rm files for highlight and shader
+HARDCODED_COLORMAP = {
+    (255, 237, 117, 255): PenColor.HIGHLIGHT_YELLOW,
+    (190, 234, 254, 255): PenColor.HIGHLIGHT_BLUE,
+    (242, 158, 255, 255): PenColor.HIGHLIGHT_PINK,
+    (255, 195, 140, 255): PenColor.HIGHLIGHT_ORANGE,
+    (172, 255, 133, 255): PenColor.HIGHLIGHT_GREEN,
+    (199, 199, 198, 255): PenColor.HIGHLIGHT_GRAY,
+    (33, 30, 28, 64): PenColor.SHADER_GRAY,
+    (254, 178, 0, 115): PenColor.SHADER_ORANGE,
+    (192, 127, 210, 128): PenColor.SHADER_MAGENTA,
+    (48, 74, 224, 77): PenColor.SHADER_BLUE,
+    (194, 49, 50, 102): PenColor.SHADER_RED,
+    (145, 218, 113, 128): PenColor.SHADER_GREEN,
+    (250, 231, 25, 115): PenColor.SHADER_YELLOW,
+    (116, 210, 232, 102): PenColor.SHADER_CYAN,
+}
+
 
 @enum.unique
 class Pen(enum.IntEnum):
@@ -104,6 +149,7 @@ class Pen(enum.IntEnum):
     PAINTBRUSH_2 = 12
     PENCIL_1 = 1
     PENCIL_2 = 14
+    SHADER = 23
 
     @classmethod
     def is_highlighter(cls, value: int) -> bool:
@@ -127,6 +173,7 @@ class Line(SceneItem):
     points: list[Point]
     thickness_scale: float
     starting_length: float
+    move_id: tp.Optional[CrdtId] = None
 
 
 ## Text
@@ -144,6 +191,8 @@ class ParagraphStyle(enum.IntEnum):
     BOLD = 3
     BULLET = 4
     BULLET2 = 5
+    CHECKBOX = 6
+    CHECKBOX_CHECKED = 7
 
 
 END_MARKER = CrdtId(0, 0)
@@ -188,7 +237,19 @@ class Rectangle:
 
 @dataclass
 class GlyphRange(SceneItem):
-    start: int
+    """Highlighted text
+
+    `start` is only available in SceneGlyphItemBlock version=0, prior to ReMarkable v3.6
+
+    `length` is the length of the text
+
+    `text` is the highlighted text itself
+
+    `color` represents the highlight color
+
+    `rectangles` represent the locations of the highlight.
+    """
+    start: tp.Optional[int]
     length: int
     text: str
     color: PenColor
